@@ -2,14 +2,21 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
+import hmac
+import ipaddress
 import json
 import os
 import secrets
+import sqlite3
 import tempfile
+import time
+from contextlib import closing
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
+from urllib.request import Request, urlopen
 
 from dotenv import load_dotenv
 from higgsfield_project import run_model, upload_file
@@ -27,6 +34,64 @@ DEFAULT_ALLOWED_ORIGINS = {
     "https://333clothingco.net",
     "https://www.333clothingco.net",
 }
+GUEST_WINDOW = 24 * 60 * 60
+GUEST_STORE_LIMIT = 30
+TURNSTILE_ACTION = "creator_studio"
+
+
+class GuestLimitReached(Exception):
+    pass
+
+
+def verify_turnstile(token: Any, secret: str, hostname: str) -> bool:
+    if not isinstance(token, str) or not 0 < len(token) <= 2048:
+        return False
+    request = Request(
+        "https://challenges.cloudflare.com/turnstile/v0/siteverify",
+        data=urlencode({"secret": secret, "response": token}).encode(),
+    )
+    with urlopen(request, timeout=8) as response:
+        result = json.load(response)
+    return (
+        result.get("success") is True
+        and result.get("action") == TURNSTILE_ACTION
+        and result.get("hostname") == hostname
+    )
+
+
+def reserve_guest_request(
+    db_path: Path, guest: str, revision: int, reference_url: str | None
+) -> int:
+    now = int(time.time())
+    cutoff = now - GUEST_WINDOW
+    with closing(sqlite3.connect(db_path, timeout=5)) as connection, connection:
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS guest_requests (
+                id INTEGER PRIMARY KEY, guest TEXT NOT NULL, revision INTEGER NOT NULL,
+                started INTEGER NOT NULL, image_url TEXT
+            )"""
+        )
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute("DELETE FROM guest_requests WHERE started <= ?", (cutoff,))
+        count = connection.execute("SELECT COUNT(*) FROM guest_requests").fetchone()[0]
+        if count >= GUEST_STORE_LIMIT:
+            raise GuestLimitReached("The store's guest AI limit is reached. Try again later.")
+        history = connection.execute(
+            "SELECT revision, image_url FROM guest_requests WHERE guest = ? ORDER BY id",
+            (guest,),
+        ).fetchall()
+        if revision == 0 and history:
+            raise GuestLimitReached("You can start one guest design every 24 hours.")
+        if revision and (
+            not history or len(history) != revision or history[0][0] != 0
+            or history[-1] != (revision - 1, reference_url) or not reference_url
+        ):
+            raise GuestLimitReached("Revise your most recent guest design in order, up to twice.")
+        cursor = connection.execute(
+            "INSERT INTO guest_requests (guest, revision, started) VALUES (?, ?, ?)",
+            (guest, revision, now),
+        )
+        return cursor.lastrowid
 
 
 def _allowed_origins() -> set[str]:
@@ -168,11 +233,13 @@ class CreatorStudioHandler(BaseHTTPRequestHandler):
             self._write_json(403, {"error": "Origin not allowed."})
             return
         token = os.getenv("CREATOR_STUDIO_PREVIEW_TOKEN", "")
-        if not token or not os.getenv("HF_KEY"):
+        if not os.getenv("HF_KEY"):
             self._write_json(503, {"error": "Generation is not configured."})
             return
         authorization = self.headers.get("Authorization", "").encode()
-        if not secrets.compare_digest(authorization, ("Bearer " + token).encode()):
+        preview = bool(token) and secrets.compare_digest(authorization, ("Bearer " + token).encode())
+        guest_enabled = os.getenv("CREATOR_STUDIO_GUEST_ENABLED") == "1"
+        if not preview and not guest_enabled:
             self._write_json(401, {"error": "Preview access required."})
             return
         try:
@@ -182,7 +249,45 @@ class CreatorStudioHandler(BaseHTTPRequestHandler):
             payload = json.loads(self.rfile.read(content_length))
             if not isinstance(payload, dict):
                 raise ValueError("The request body must be a JSON object.")
-            self._write_json(200, generate(payload))
+            if preview:
+                self._write_json(200, generate(payload))
+                return
+            secret = os.getenv("TURNSTILE_SECRET_KEY")
+            mount = os.getenv("RAILWAY_VOLUME_MOUNT_PATH")
+            if not secret or not mount or not Path(mount).is_mount():
+                self._write_json(503, {"error": "Guest generation is temporarily unavailable."})
+                return
+            revision = payload.get("revision", 0)
+            if type(revision) is not int or revision not in {0, 1, 2}:
+                raise ValueError("Only the initial design and two revisions are supported.")
+            prompt = payload.get("prompt")
+            wording = payload.get("wording", "")
+            if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 500:
+                raise ValueError("Enter a design or revision description up to 500 characters.")
+            if not isinstance(wording, str) or len(wording) > 48:
+                raise ValueError("Exact wording must be 48 characters or fewer.")
+            reference_url = _validated_reference_url(payload.get("reference_url"))
+            if revision == 0 and reference_url:
+                raise ValueError("Choose a reference file to start a guest design.")
+            hostname = urlparse(self._origin()).hostname
+            if not verify_turnstile(payload.get("turnstile_token"), secret, hostname):
+                self._write_json(403, {"error": "Please complete the verification and try again."})
+                return
+            address = ipaddress.ip_address(self.headers.get("X-Real-IP", ""))
+            if isinstance(address, ipaddress.IPv6Address):
+                address = ipaddress.ip_network((address, 64), strict=False).network_address
+            guest = hmac.new(secret.encode(), str(address).encode(), hashlib.sha256).hexdigest()
+            db_path = Path(mount) / "guest-usage.sqlite3"
+            request_id = reserve_guest_request(db_path, guest, revision, reference_url)
+            result = generate(payload)
+            with closing(sqlite3.connect(db_path, timeout=5)) as connection, connection:
+                connection.execute(
+                    "UPDATE guest_requests SET image_url = ? WHERE id = ?",
+                    (result["image_url"], request_id),
+                )
+            self._write_json(200, result)
+        except GuestLimitReached as exc:
+            self._write_json(429, {"error": str(exc)})
         except (ValueError, json.JSONDecodeError) as exc:
             self._write_json(400, {"error": str(exc)})
         except Exception:
