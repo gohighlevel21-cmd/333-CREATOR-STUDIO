@@ -274,8 +274,9 @@ class CreatorStudioHandler(BaseHTTPRequestHandler):
                 raise ValueError("Only the initial design and two revisions are supported.")
             prompt = payload.get("prompt")
             wording = payload.get("wording", "")
-            if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 500:
-                raise ValueError("Enter a design or revision description up to 500 characters.")
+            prompt_limit = 500 if revision else 2500
+            if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > prompt_limit:
+                raise ValueError(f"Enter a description up to {prompt_limit:,} characters.")
             if not isinstance(wording, str) or len(wording) > 48:
                 raise ValueError("Exact wording must be 48 characters or fewer.")
             reference_url = _validated_reference_url(payload.get("reference_url"))
