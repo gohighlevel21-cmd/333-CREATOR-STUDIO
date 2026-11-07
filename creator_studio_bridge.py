@@ -8,10 +8,8 @@ import ipaddress
 import json
 import os
 import secrets
-import sqlite3
 import tempfile
 import time
-from contextlib import closing
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -60,24 +58,28 @@ def verify_turnstile(token: Any, secret: str, hostname: str) -> bool:
 
 
 def reserve_guest_request(
-    db_path: Path, guest: str, revision: int, reference_url: str | None
+    database_url: str, guest: str, revision: int, reference_url: str | None
 ) -> int:
+    import psycopg
+
     now = int(time.time())
     cutoff = now - GUEST_WINDOW
-    with closing(sqlite3.connect(db_path, timeout=5)) as connection, connection:
+    with psycopg.connect(database_url, connect_timeout=5) as connection:
+        connection.execute("SET LOCAL lock_timeout = '5s'")
+        connection.execute("SELECT pg_advisory_xact_lock(3331717)")
         connection.execute(
             """CREATE TABLE IF NOT EXISTS guest_requests (
-                id INTEGER PRIMARY KEY, guest TEXT NOT NULL, revision INTEGER NOT NULL,
-                started INTEGER NOT NULL, image_url TEXT
+                id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                guest TEXT NOT NULL, revision INTEGER NOT NULL,
+                started BIGINT NOT NULL, image_url TEXT
             )"""
         )
-        connection.execute("BEGIN IMMEDIATE")
-        connection.execute("DELETE FROM guest_requests WHERE started <= ?", (cutoff,))
+        connection.execute("DELETE FROM guest_requests WHERE started <= %s", (cutoff,))
         count = connection.execute("SELECT COUNT(*) FROM guest_requests").fetchone()[0]
         if count >= GUEST_STORE_LIMIT:
             raise GuestLimitReached("The store's guest AI limit is reached. Try again later.")
         history = connection.execute(
-            "SELECT revision, image_url FROM guest_requests WHERE guest = ? ORDER BY id",
+            "SELECT revision, image_url FROM guest_requests WHERE guest = %s ORDER BY id",
             (guest,),
         ).fetchall()
         if revision == 0 and history:
@@ -88,10 +90,20 @@ def reserve_guest_request(
         ):
             raise GuestLimitReached("Revise your most recent guest design in order, up to twice.")
         cursor = connection.execute(
-            "INSERT INTO guest_requests (guest, revision, started) VALUES (?, ?, ?)",
+            "INSERT INTO guest_requests (guest, revision, started) VALUES (%s, %s, %s) RETURNING id",
             (guest, revision, now),
         )
-        return cursor.lastrowid
+        return cursor.fetchone()[0]
+
+
+def record_guest_image(database_url: str, request_id: int, image_url: str) -> None:
+    import psycopg
+
+    with psycopg.connect(database_url, connect_timeout=5) as connection:
+        connection.execute(
+            "UPDATE guest_requests SET image_url = %s WHERE id = %s",
+            (image_url, request_id),
+        )
 
 
 def _allowed_origins() -> set[str]:
@@ -253,8 +265,8 @@ class CreatorStudioHandler(BaseHTTPRequestHandler):
                 self._write_json(200, generate(payload))
                 return
             secret = os.getenv("TURNSTILE_SECRET_KEY")
-            mount = os.getenv("RAILWAY_VOLUME_MOUNT_PATH")
-            if not secret or not mount or not Path(mount).is_mount():
+            database_url = os.getenv("CREATOR_STUDIO_QUOTA_DATABASE_URL")
+            if not secret or not database_url:
                 self._write_json(503, {"error": "Guest generation is temporarily unavailable."})
                 return
             revision = payload.get("revision", 0)
@@ -277,14 +289,9 @@ class CreatorStudioHandler(BaseHTTPRequestHandler):
             if isinstance(address, ipaddress.IPv6Address):
                 address = ipaddress.ip_network((address, 64), strict=False).network_address
             guest = hmac.new(secret.encode(), str(address).encode(), hashlib.sha256).hexdigest()
-            db_path = Path(mount) / "guest-usage.sqlite3"
-            request_id = reserve_guest_request(db_path, guest, revision, reference_url)
+            request_id = reserve_guest_request(database_url, guest, revision, reference_url)
             result = generate(payload)
-            with closing(sqlite3.connect(db_path, timeout=5)) as connection, connection:
-                connection.execute(
-                    "UPDATE guest_requests SET image_url = ? WHERE id = ?",
-                    (result["image_url"], request_id),
-                )
+            record_guest_image(database_url, request_id, result["image_url"])
             self._write_json(200, result)
         except GuestLimitReached as exc:
             self._write_json(429, {"error": str(exc)})
