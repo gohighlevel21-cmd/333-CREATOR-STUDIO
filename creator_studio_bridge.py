@@ -34,6 +34,7 @@ DEFAULT_ALLOWED_ORIGINS = {
 }
 GUEST_WINDOW = 24 * 60 * 60
 GUEST_STORE_LIMIT = 30
+GUEST_NETWORK_DESIGN_LIMIT = 3
 TURNSTILE_ACTION = "creator_studio"
 
 
@@ -82,13 +83,19 @@ def reserve_guest_request(
             "SELECT revision, image_url FROM guest_requests WHERE guest = %s ORDER BY id",
             (guest,),
         ).fetchall()
-        if revision == 0 and history:
-            raise GuestLimitReached("You can start one guest design every 24 hours.")
-        if revision and (
-            not history or len(history) != revision or history[0][0] != 0
-            or history[-1] != (revision - 1, reference_url) or not reference_url
-        ):
-            raise GuestLimitReached("Revise your most recent guest design in order, up to twice.")
+        starts = [index for index, (step, _) in enumerate(history) if step == 0]
+        if revision == 0:
+            if len(starts) >= GUEST_NETWORK_DESIGN_LIMIT:
+                raise GuestLimitReached(
+                    f"This network can start {GUEST_NETWORK_DESIGN_LIMIT} guest designs every 24 hours."
+                )
+        else:
+            latest_design = history[starts[-1]:] if starts else []
+            if (
+                len(latest_design) != revision or not reference_url
+                or latest_design[-1] != (revision - 1, reference_url)
+            ):
+                raise GuestLimitReached("Revise your most recent guest design in order, up to twice.")
         cursor = connection.execute(
             "INSERT INTO guest_requests (guest, revision, started) VALUES (%s, %s, %s) RETURNING id",
             (guest, revision, now),
