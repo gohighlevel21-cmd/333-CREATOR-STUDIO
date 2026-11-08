@@ -26,6 +26,8 @@ from PIL import Image
 ENDPOINT = "marketing-studio/image/flare"
 GENERATE_PATH = "/api/creator-studio/generate"
 OPENAI_PREVIEW_PATH = "/api/creator-studio/openai-preview"
+OPENAI_PUBLIC_PATH = "/api/creator-studio/openai"
+DESIGN_PATHS = {GENERATE_PATH, OPENAI_PREVIEW_PATH, OPENAI_PUBLIC_PATH}
 OPENAI_IMAGE_MODEL = "gpt-image-2.5-flare"
 OPENAI_IMAGE_SIZE = (2048, 2048)
 PRINT_DPI = 400
@@ -124,6 +126,24 @@ def record_guest_image(database_url: str, request_id: int, image_url: str) -> No
             "UPDATE guest_requests SET image_url = %s WHERE id = %s",
             (image_url, request_id),
         )
+
+
+def guest_artwork_key(image_url: Any) -> str | None:
+    if not image_url:
+        return None
+    if not isinstance(image_url, str) or not image_url.startswith("data:image/png;base64,"):
+        raise ValueError("Use a generated design from this Creator Studio session.")
+    return "openai:" + hashlib.sha256(image_url.encode()).hexdigest()
+
+
+def guest_has_artwork(database_url: str, guest: str, artwork_key: str) -> bool:
+    import psycopg
+
+    with psycopg.connect(database_url, connect_timeout=5) as connection:
+        return connection.execute(
+            "SELECT EXISTS (SELECT 1 FROM guest_requests WHERE guest = %s AND image_url = %s AND started > %s)",
+            (guest, artwork_key, int(time.time()) - GUEST_WINDOW),
+        ).fetchone()[0]
 
 
 def _allowed_origins() -> set[str]:
@@ -366,7 +386,7 @@ class CreatorStudioHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_OPTIONS(self) -> None:
-        if self.path not in {GENERATE_PATH, OPENAI_PREVIEW_PATH} or not self._origin():
+        if self.path not in DESIGN_PATHS or not self._origin():
             self._write_json(403, {"error": "Origin not allowed."})
             return
         self.send_response(204)
@@ -378,7 +398,7 @@ class CreatorStudioHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_POST(self) -> None:
-        if self.path not in {GENERATE_PATH, OPENAI_PREVIEW_PATH}:
+        if self.path not in DESIGN_PATHS:
             self._write_json(404, {"error": "Not found."})
             return
         if not self._origin():
@@ -388,20 +408,23 @@ class CreatorStudioHandler(BaseHTTPRequestHandler):
         authorization = self.headers.get("Authorization", "").encode()
         preview = bool(token) and secrets.compare_digest(authorization, ("Bearer " + token).encode())
         openai_preview = self.path == OPENAI_PREVIEW_PATH
-        api_key = os.getenv("OPENAI_API_KEY", "").strip() if openai_preview else ""
-        if openai_preview:
-            if not preview:
-                self._write_json(401, {"error": "Preview access required."})
-                return
+        openai_public = self.path == OPENAI_PUBLIC_PATH
+        if openai_preview and not preview:
+            self._write_json(401, {"error": "Preview access required."})
+            return
+        api_key = ""
+        if openai_preview or openai_public:
+            api_key = os.getenv("OPENAI_API_KEY", "").strip()
             if not api_key:
-                self._write_json(503, {"error": "Add OPENAI_API_KEY in Railway to start this preview."})
+                self._write_json(503, {"error": "OpenAI generation is temporarily unavailable."})
                 return
         elif not os.getenv("HF_KEY"):
             self._write_json(503, {"error": "Generation is not configured."})
             return
         guest_enabled = os.getenv("CREATOR_STUDIO_GUEST_ENABLED") == "1"
-        if not preview and not guest_enabled:
-            self._write_json(401, {"error": "Preview access required."})
+        if not guest_enabled and (openai_public or not preview):
+            message = "Guest generation is temporarily unavailable." if openai_public else "Preview access required."
+            self._write_json(503 if openai_public else 401, {"error": message})
             return
         try:
             content_length = int(self.headers.get("Content-Length", "0"))
@@ -414,13 +437,28 @@ class CreatorStudioHandler(BaseHTTPRequestHandler):
                 result = export_openai_print(payload) if payload.get("action") == "export_print" else generate_openai_preview(payload, api_key)
                 self._write_json(200, result)
                 return
-            if preview:
+            if preview and not openai_public:
                 self._write_json(200, generate(payload))
                 return
             secret = os.getenv("TURNSTILE_SECRET_KEY")
             database_url = os.getenv("CREATOR_STUDIO_QUOTA_DATABASE_URL")
             if not secret or not database_url:
                 self._write_json(503, {"error": "Guest generation is temporarily unavailable."})
+                return
+            hostname = urlparse(self._origin()).hostname
+            if not verify_turnstile(payload.get("turnstile_token"), secret, hostname):
+                self._write_json(403, {"error": "Please complete the verification and try again."})
+                return
+            address = ipaddress.ip_address(self.headers.get("X-Real-IP", ""))
+            if isinstance(address, ipaddress.IPv6Address):
+                address = ipaddress.ip_network((address, 64), strict=False).network_address
+            guest = hmac.new(secret.encode(), str(address).encode(), hashlib.sha256).hexdigest()
+            if openai_public and payload.get("action") == "export_print":
+                artwork_key = guest_artwork_key(payload.get("image_url"))
+                if not artwork_key or not guest_has_artwork(database_url, guest, artwork_key):
+                    self._write_json(403, {"error": "The generated artwork is no longer available for this session."})
+                    return
+                self._write_json(200, export_openai_print(payload))
                 return
             revision = payload.get("revision", 0)
             if type(revision) is not int or revision not in {0, 1, 2}:
@@ -432,20 +470,14 @@ class CreatorStudioHandler(BaseHTTPRequestHandler):
                 raise ValueError(f"Enter a description up to {prompt_limit:,} characters.")
             if not isinstance(wording, str) or len(wording) > 48:
                 raise ValueError("Exact wording must be 48 characters or fewer.")
-            reference_url = _validated_reference_url(payload.get("reference_url"))
-            if revision == 0 and reference_url:
+            reference = payload.get("reference_url")
+            reference_key = guest_artwork_key(reference) if openai_public else _validated_reference_url(reference)
+            if revision == 0 and reference_key:
                 raise ValueError("Choose a reference file to start a guest design.")
-            hostname = urlparse(self._origin()).hostname
-            if not verify_turnstile(payload.get("turnstile_token"), secret, hostname):
-                self._write_json(403, {"error": "Please complete the verification and try again."})
-                return
-            address = ipaddress.ip_address(self.headers.get("X-Real-IP", ""))
-            if isinstance(address, ipaddress.IPv6Address):
-                address = ipaddress.ip_network((address, 64), strict=False).network_address
-            guest = hmac.new(secret.encode(), str(address).encode(), hashlib.sha256).hexdigest()
-            request_id = reserve_guest_request(database_url, guest, revision, reference_url)
-            result = generate(payload)
-            record_guest_image(database_url, request_id, result["image_url"])
+            request_id = reserve_guest_request(database_url, guest, revision, reference_key)
+            result = generate_openai_preview(payload, api_key) if openai_public else generate(payload)
+            image_key = guest_artwork_key(result["image_url"]) if openai_public else result["image_url"]
+            record_guest_image(database_url, request_id, image_key)
             self._write_json(200, result)
         except GuestLimitReached as exc:
             self._write_json(429, {"error": str(exc)})
