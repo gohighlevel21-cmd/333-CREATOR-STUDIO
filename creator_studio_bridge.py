@@ -11,6 +11,7 @@ import secrets
 import tempfile
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError
@@ -19,12 +20,16 @@ from urllib.request import Request, urlopen
 
 from dotenv import load_dotenv
 from higgsfield_project import run_model, upload_file
+from PIL import Image
 
 
 ENDPOINT = "marketing-studio/image/flare"
 GENERATE_PATH = "/api/creator-studio/generate"
 OPENAI_PREVIEW_PATH = "/api/creator-studio/openai-preview"
-OPENAI_IMAGE_MODEL = "chatgpt-image-latest"
+OPENAI_IMAGE_MODEL = "gpt-image-2.5-flare"
+OPENAI_IMAGE_SIZE = (2048, 2048)
+PRINT_DPI = 400
+PRINT_SIZE = (4200, 4200)  # 10.5 inches on each side at 400 DPI.
 MAX_UPLOAD_BYTES = 25_000_000
 MAX_REQUEST_BYTES = 34_000_000
 ALLOWED_MIME_TYPES = {
@@ -172,7 +177,9 @@ def _upload_data_url(value: Any) -> str | None:
             Path(temporary_path).unlink(missing_ok=True)
 
 
-def _design_instruction(payload: dict[str, Any], *, preserve_reference: bool = False) -> tuple[str, int]:
+def _design_instruction(
+    payload: dict[str, Any], *, preserve_reference: bool = False, transparent: bool = False
+) -> tuple[str, int]:
     prompt = str(payload.get("prompt", "")).strip()
     wording = str(payload.get("wording", "")).strip()
     revision = int(payload.get("revision", 0))
@@ -191,9 +198,10 @@ def _design_instruction(payload: dict[str, Any], *, preserve_reference: bool = F
             f"Customer instructions: {prompt}{exact_wording}",
             revision,
         )
+    background = "" if transparent else "a clean solid background, "
     instruction = (
         f"Create one print-ready apparel graphic from this description: {prompt}.{exact_wording} "
-        "Return only the flat square artwork, not a shirt mockup. Use a clean solid background, "
+        f"Return only the flat square artwork, not a shirt mockup. Use {background}"
         "crisp edges, high contrast, no person, no watermark, and no extra text."
         if revision == 0
         else f"Revise the supplied artwork with this instruction: {prompt}.{exact_wording} "
@@ -232,15 +240,23 @@ def generate(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def generate_openai_preview(payload: dict[str, Any], api_key: str) -> dict[str, Any]:
-    instruction, revision = _design_instruction(payload, preserve_reference=bool(payload.get("reference_data_url")))
+    instruction, revision = _design_instruction(
+        payload, preserve_reference=bool(payload.get("reference_data_url")), transparent=True
+    )
+    instruction += (
+        "\n\nPrint output requirement: isolate the artwork on real transparency. Keep the area outside the design "
+        "fully transparent even if the description or reference shows a background. Do not draw a checkerboard "
+        "or other visual simulation of transparency."
+    )
     reference = payload.get("reference_url" if revision else "reference_data_url")
     if revision and not reference:
         raise ValueError("A generated design is required before revising it.")
     fields = {
         "model": OPENAI_IMAGE_MODEL,
         "prompt": instruction,
-        "size": "1024x1024",
-        "quality": "medium",
+        "size": "2048x2048",
+        "quality": "high",
+        "background": "transparent",
         "output_format": "png",
     }
     if reference:
@@ -287,10 +303,39 @@ def generate_openai_preview(payload: dict[str, Any], api_key: str) -> dict[str, 
     if not encoded:
         raise OpenAIImageError("OpenAI completed without returning an image.")
     image_url = "data:image/png;base64," + encoded
-    _decode_reference(image_url)
+    _openai_artwork(image_url)
     mode = "revision" if revision else "reference-edit" if reference else "text-generation"
     print(f"OpenAI preview completed: mode={mode}", flush=True)
     return {"image_url": image_url, "request_id": request_id, "revision": revision}
+
+
+def _openai_artwork(image_url: Any) -> Image.Image:
+    mime_type, data = _decode_reference(image_url)
+    if mime_type != "image/png":
+        raise ValueError("The generated artwork must be a PNG.")
+    try:
+        with Image.open(BytesIO(data), formats=["PNG"]) as source:
+            if source.size != OPENAI_IMAGE_SIZE:
+                raise ValueError("The generated artwork must be 2048 × 2048 pixels.")
+            artwork = source.convert("RGBA")
+    except (OSError, Image.DecompressionBombError) as exc:
+        raise ValueError("The generated PNG could not be opened.") from exc
+    minimum, maximum = artwork.getchannel("A").getextrema()
+    if minimum != 0 or maximum == 0:
+        raise ValueError("OpenAI did not return artwork with a transparent background. Try generating again.")
+    return artwork
+
+
+def export_openai_print(payload: dict[str, Any]) -> dict[str, str]:
+    artwork = _openai_artwork(payload.get("image_url"))
+    with BytesIO() as output:
+        artwork.resize(PRINT_SIZE, Image.Resampling.LANCZOS).save(
+            output, "PNG", dpi=(PRINT_DPI, PRINT_DPI), icc_profile=artwork.info.get("icc_profile")
+        )
+        if output.tell() > MAX_UPLOAD_BYTES:
+            raise ValueError("The print PNG exceeds the 25 MB attachment limit. Try a simpler design.")
+        encoded = base64.b64encode(output.getbuffer()).decode("ascii")
+    return {"image_url": "data:image/png;base64," + encoded}
 
 
 class CreatorStudioHandler(BaseHTTPRequestHandler):
@@ -366,7 +411,8 @@ class CreatorStudioHandler(BaseHTTPRequestHandler):
             if not isinstance(payload, dict):
                 raise ValueError("The request body must be a JSON object.")
             if openai_preview:
-                self._write_json(200, generate_openai_preview(payload, api_key))
+                result = export_openai_print(payload) if payload.get("action") == "export_print" else generate_openai_preview(payload, api_key)
+                self._write_json(200, result)
                 return
             if preview:
                 self._write_json(200, generate(payload))
