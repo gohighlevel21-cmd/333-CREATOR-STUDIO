@@ -13,6 +13,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError
 from urllib.parse import urlencode, urlparse
 from urllib.request import Request, urlopen
 
@@ -21,6 +22,9 @@ from higgsfield_project import run_model, upload_file
 
 
 ENDPOINT = "marketing-studio/image/flare"
+GENERATE_PATH = "/api/creator-studio/generate"
+OPENAI_PREVIEW_PATH = "/api/creator-studio/openai-preview"
+OPENAI_IMAGE_MODEL = "chatgpt-image-latest"
 MAX_UPLOAD_BYTES = 25_000_000
 MAX_REQUEST_BYTES = 34_000_000
 ALLOWED_MIME_TYPES = {
@@ -39,6 +43,10 @@ TURNSTILE_ACTION = "creator_studio"
 
 
 class GuestLimitReached(Exception):
+    pass
+
+
+class OpenAIImageError(Exception):
     pass
 
 
@@ -132,9 +140,7 @@ def _validated_reference_url(value: Any) -> str | None:
     return str(value)
 
 
-def _upload_data_url(value: Any) -> str | None:
-    if not value:
-        return None
+def _decode_reference(value: Any) -> tuple[str, bytes]:
     header, separator, encoded = str(value).partition(",")
     if not separator or not header.startswith("data:") or ";base64" not in header:
         raise ValueError("The reference image is not a valid data URL.")
@@ -146,11 +152,18 @@ def _upload_data_url(value: Any) -> str | None:
         payload = base64.b64decode(encoded, validate=True)
     except (ValueError, binascii.Error) as exc:
         raise ValueError("The reference image could not be decoded.") from exc
-    if len(payload) > MAX_UPLOAD_BYTES:
+    if not payload or len(payload) > MAX_UPLOAD_BYTES:
         raise ValueError("Reference images must be 25 MB or smaller.")
+    return mime_type, payload
+
+
+def _upload_data_url(value: Any) -> str | None:
+    if not value:
+        return None
+    mime_type, payload = _decode_reference(value)
     temporary_path: str | None = None
     try:
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temporary:
+        with tempfile.NamedTemporaryFile(suffix=ALLOWED_MIME_TYPES[mime_type], delete=False) as temporary:
             temporary.write(payload)
             temporary_path = temporary.name
         return upload_file(temporary_path)
@@ -159,7 +172,7 @@ def _upload_data_url(value: Any) -> str | None:
             Path(temporary_path).unlink(missing_ok=True)
 
 
-def generate(payload: dict[str, Any]) -> dict[str, Any]:
+def _design_instruction(payload: dict[str, Any]) -> tuple[str, int]:
     prompt = str(payload.get("prompt", "")).strip()
     wording = str(payload.get("wording", "")).strip()
     revision = int(payload.get("revision", 0))
@@ -167,12 +180,6 @@ def generate(payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("Only the initial design and two revisions are supported.")
     if not prompt:
         raise ValueError("Describe the design or revision you want.")
-
-    reference_url = _validated_reference_url(payload.get("reference_url"))
-    if revision == 0 and not reference_url:
-        reference_url = _upload_data_url(payload.get("reference_data_url"))
-    if revision and not reference_url:
-        raise ValueError("A generated design is required before revising it.")
 
     exact_wording = f' The artwork must include the exact wording: "{wording}".' if wording else ""
     instruction = (
@@ -184,6 +191,16 @@ def generate(payload: dict[str, Any]) -> dict[str, Any]:
         "Preserve everything not explicitly changed. Return only the flat square artwork, "
         "not a shirt mockup, with no watermark."
     )
+    return instruction, revision
+
+
+def generate(payload: dict[str, Any]) -> dict[str, Any]:
+    instruction, revision = _design_instruction(payload)
+    reference_url = _validated_reference_url(payload.get("reference_url"))
+    if revision == 0 and not reference_url:
+        reference_url = _upload_data_url(payload.get("reference_data_url"))
+    if revision and not reference_url:
+        raise ValueError("A generated design is required before revising it.")
     arguments: dict[str, Any] = {
         "prompt": instruction,
         "quality": "low",
@@ -203,6 +220,66 @@ def generate(payload: dict[str, Any]) -> dict[str, Any]:
         "request_id": result.get("request_id"),
         "revision": revision,
     }
+
+
+def generate_openai_preview(payload: dict[str, Any], api_key: str) -> dict[str, Any]:
+    instruction, revision = _design_instruction(payload)
+    reference = payload.get("reference_url" if revision else "reference_data_url")
+    if revision and not reference:
+        raise ValueError("A generated design is required before revising it.")
+    fields = {
+        "model": OPENAI_IMAGE_MODEL,
+        "prompt": instruction,
+        "size": "1024x1024",
+        "quality": "medium",
+        "output_format": "png",
+    }
+    if reference:
+        mime_type, artwork = _decode_reference(reference)
+        boundary = secrets.token_hex(24)
+        parts = [
+            f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode()
+            for name, value in fields.items()
+        ]
+        filename = "reference" + ALLOWED_MIME_TYPES[mime_type]
+        parts.extend([
+            (f'--{boundary}\r\nContent-Disposition: form-data; name="image[]"; filename="{filename}"\r\n'
+             f"Content-Type: {mime_type}\r\n\r\n").encode(),
+            artwork,
+            f"\r\n--{boundary}--\r\n".encode(),
+        ])
+        endpoint = "edits"
+        body = b"".join(parts)
+        content_type = f"multipart/form-data; boundary={boundary}"
+    else:
+        endpoint = "generations"
+        body = json.dumps(fields).encode()
+        content_type = "application/json"
+    request = Request(
+        f"https://api.openai.com/v1/images/{endpoint}",
+        data=body,
+        headers={"Authorization": "Bearer " + api_key, "Content-Type": content_type},
+    )
+    try:
+        with urlopen(request, timeout=150) as response:
+            result = json.loads(response.read(MAX_REQUEST_BYTES))
+            request_id = response.headers.get("x-request-id")
+    except HTTPError as exc:
+        exc.close()
+        messages = {
+            400: "OpenAI could not process this request. Try a simpler description or a different reference image.",
+            401: "Check the OpenAI API key in Railway.",
+            403: "Check that your OpenAI API project has access to this image model.",
+            429: "OpenAI rejected the request due to a usage limit. Check API billing and limits.",
+        }
+        raise OpenAIImageError(messages.get(exc.code, "OpenAI could not generate the design. Try again.")) from exc
+    images = result.get("data") or []
+    encoded = images[0].get("b64_json") if images else None
+    if not encoded:
+        raise OpenAIImageError("OpenAI completed without returning an image.")
+    image_url = "data:image/png;base64," + encoded
+    _decode_reference(image_url)
+    return {"image_url": image_url, "request_id": request_id, "revision": revision}
 
 
 class CreatorStudioHandler(BaseHTTPRequestHandler):
@@ -233,7 +310,7 @@ class CreatorStudioHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_OPTIONS(self) -> None:
-        if self.path != "/api/creator-studio/generate" or not self._origin():
+        if self.path not in {GENERATE_PATH, OPENAI_PREVIEW_PATH} or not self._origin():
             self._write_json(403, {"error": "Origin not allowed."})
             return
         self.send_response(204)
@@ -245,18 +322,27 @@ class CreatorStudioHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_POST(self) -> None:
-        if self.path != "/api/creator-studio/generate":
+        if self.path not in {GENERATE_PATH, OPENAI_PREVIEW_PATH}:
             self._write_json(404, {"error": "Not found."})
             return
         if not self._origin():
             self._write_json(403, {"error": "Origin not allowed."})
             return
         token = os.getenv("CREATOR_STUDIO_PREVIEW_TOKEN", "")
-        if not os.getenv("HF_KEY"):
-            self._write_json(503, {"error": "Generation is not configured."})
-            return
         authorization = self.headers.get("Authorization", "").encode()
         preview = bool(token) and secrets.compare_digest(authorization, ("Bearer " + token).encode())
+        openai_preview = self.path == OPENAI_PREVIEW_PATH
+        api_key = os.getenv("OPENAI_API_KEY", "").strip() if openai_preview else ""
+        if openai_preview:
+            if not preview:
+                self._write_json(401, {"error": "Preview access required."})
+                return
+            if not api_key:
+                self._write_json(503, {"error": "Add OPENAI_API_KEY in Railway to start this preview."})
+                return
+        elif not os.getenv("HF_KEY"):
+            self._write_json(503, {"error": "Generation is not configured."})
+            return
         guest_enabled = os.getenv("CREATOR_STUDIO_GUEST_ENABLED") == "1"
         if not preview and not guest_enabled:
             self._write_json(401, {"error": "Preview access required."})
@@ -268,6 +354,9 @@ class CreatorStudioHandler(BaseHTTPRequestHandler):
             payload = json.loads(self.rfile.read(content_length))
             if not isinstance(payload, dict):
                 raise ValueError("The request body must be a JSON object.")
+            if openai_preview:
+                self._write_json(200, generate_openai_preview(payload, api_key))
+                return
             if preview:
                 self._write_json(200, generate(payload))
                 return
@@ -303,6 +392,8 @@ class CreatorStudioHandler(BaseHTTPRequestHandler):
             self._write_json(200, result)
         except GuestLimitReached as exc:
             self._write_json(429, {"error": str(exc)})
+        except OpenAIImageError as exc:
+            self._write_json(502, {"error": str(exc)})
         except (ValueError, json.JSONDecodeError) as exc:
             self._write_json(400, {"error": str(exc)})
         except Exception:
