@@ -172,7 +172,7 @@ def _upload_data_url(value: Any) -> str | None:
             Path(temporary_path).unlink(missing_ok=True)
 
 
-def _design_instruction(payload: dict[str, Any]) -> tuple[str, int]:
+def _design_instruction(payload: dict[str, Any], *, preserve_reference: bool = False) -> tuple[str, int]:
     prompt = str(payload.get("prompt", "")).strip()
     wording = str(payload.get("wording", "")).strip()
     revision = int(payload.get("revision", 0))
@@ -182,6 +182,15 @@ def _design_instruction(payload: dict[str, Any]) -> tuple[str, int]:
         raise ValueError("Describe the design or revision you want.")
 
     exact_wording = f' The artwork must include the exact wording: "{wording}".' if wording else ""
+    if revision == 0 and preserve_reference:
+        return (
+            "Use the uploaded image as the primary source for the artwork. Apply only the requested changes. "
+            "Preserve the recognizable subject, distinctive features, composition, proportions, colors, "
+            "and any existing artwork text unless the customer asks to change them. If the artwork is "
+            "shown on a shirt or mockup, extract the design itself. Return only the flat square artwork.\n\n"
+            f"Customer instructions: {prompt}{exact_wording}",
+            revision,
+        )
     instruction = (
         f"Create one print-ready apparel graphic from this description: {prompt}.{exact_wording} "
         "Return only the flat square artwork, not a shirt mockup. Use a clean solid background, "
@@ -223,7 +232,7 @@ def generate(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def generate_openai_preview(payload: dict[str, Any], api_key: str) -> dict[str, Any]:
-    instruction, revision = _design_instruction(payload)
+    instruction, revision = _design_instruction(payload, preserve_reference=bool(payload.get("reference_data_url")))
     reference = payload.get("reference_url" if revision else "reference_data_url")
     if revision and not reference:
         raise ValueError("A generated design is required before revising it.")
@@ -279,6 +288,8 @@ def generate_openai_preview(payload: dict[str, Any], api_key: str) -> dict[str, 
         raise OpenAIImageError("OpenAI completed without returning an image.")
     image_url = "data:image/png;base64," + encoded
     _decode_reference(image_url)
+    mode = "revision" if revision else "reference-edit" if reference else "text-generation"
+    print(f"OpenAI preview completed: mode={mode}", flush=True)
     return {"image_url": image_url, "request_id": request_id, "revision": revision}
 
 
