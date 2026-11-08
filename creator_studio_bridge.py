@@ -74,7 +74,7 @@ def verify_turnstile(token: Any, secret: str, hostname: str) -> bool:
 
 
 def reserve_guest_request(
-    database_url: str, guest: str, revision: int, reference_url: str | None
+    database_url: str, guest: str, revision: int, reference_url: str | None, *, smoke_since: int = 0
 ) -> int:
     import psycopg
 
@@ -101,9 +101,14 @@ def reserve_guest_request(
         starts = [index for index, (step, _) in enumerate(history) if step == 0]
         if revision == 0:
             if len(starts) >= GUEST_NETWORK_DESIGN_LIMIT:
-                raise GuestLimitReached(
-                    f"This network can start {GUEST_NETWORK_DESIGN_LIMIT} guest designs every 24 hours."
-                )
+                eligible = smoke_since and 0 <= now - smoke_since < 900
+                if not eligible or connection.execute(
+                    "SELECT EXISTS (SELECT 1 FROM guest_requests WHERE guest = %s AND revision = 0 AND started >= %s)",
+                    (guest, smoke_since),
+                ).fetchone()[0]:
+                    raise GuestLimitReached(
+                        f"This network can start {GUEST_NETWORK_DESIGN_LIMIT} guest designs every 24 hours."
+                    )
         else:
             latest_design = history[starts[-1]:] if starts else []
             if (
@@ -450,6 +455,10 @@ class CreatorStudioHandler(BaseHTTPRequestHandler):
                 self._write_json(403, {"error": "Please complete the verification and try again."})
                 return
             address = ipaddress.ip_address(self.headers.get("X-Real-IP", ""))
+            smoke_since, _, smoke_ip = os.getenv("CREATOR_STUDIO_SMOKE_ALLOWANCE", "").partition(":")
+            smoke_options = {}
+            if openai_public and smoke_since.isdecimal() and str(address) == smoke_ip:
+                smoke_options["smoke_since"] = int(smoke_since)
             if isinstance(address, ipaddress.IPv6Address):
                 address = ipaddress.ip_network((address, 64), strict=False).network_address
             guest = hmac.new(secret.encode(), str(address).encode(), hashlib.sha256).hexdigest()
@@ -474,7 +483,7 @@ class CreatorStudioHandler(BaseHTTPRequestHandler):
             reference_key = guest_artwork_key(reference) if openai_public else _validated_reference_url(reference)
             if revision == 0 and reference_key:
                 raise ValueError("Choose a reference file to start a guest design.")
-            request_id = reserve_guest_request(database_url, guest, revision, reference_key)
+            request_id = reserve_guest_request(database_url, guest, revision, reference_key, **smoke_options)
             result = generate_openai_preview(payload, api_key) if openai_public else generate(payload)
             image_key = guest_artwork_key(result["image_url"]) if openai_public else result["image_url"]
             record_guest_image(database_url, request_id, image_key)
